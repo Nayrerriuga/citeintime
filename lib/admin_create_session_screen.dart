@@ -1,9 +1,14 @@
+import 'dart:math' as math;
 import 'package:flutter/material.dart';
 import 'package:flutter_map/flutter_map.dart';
-import 'package:geolocator/geolocator.dart';
 import 'package:intl/intl.dart';
 import 'package:latlong2/latlong.dart';
 import 'package:supabase_flutter/supabase_flutter.dart';
+import 'services/admin_session_service.dart';
+import 'theme/grand_line_theme.dart';
+import 'widgets/admin_analytics_view.dart';
+import 'widgets/admin_geofence_map.dart';
+import 'widgets/admin_manage_sessions_view.dart';
 
 class AdminCreateSessionScreen extends StatefulWidget {
   const AdminCreateSessionScreen({super.key});
@@ -13,12 +18,15 @@ class AdminCreateSessionScreen extends StatefulWidget {
       _AdminCreateSessionScreenState();
 }
 
-class _AdminCreateSessionScreenState extends State<AdminCreateSessionScreen> {
+class _AdminCreateSessionScreenState extends State<AdminCreateSessionScreen>
+    with TickerProviderStateMixin {
   final _formKey = GlobalKey<FormState>();
   final _titleController = TextEditingController();
-  final MapController _mapController = MapController();
+  final _mapController = MapController();
+  final _sessionService = AdminSessionService();
 
-  // Default coordinates (updates automatically if GPS permission is granted)
+  int _activeTabIndex = 0; // 0 = Create, 1 = Manage, 2 = Analytics
+
   LatLng _selectedLocation = const LatLng(8.7458, 124.7764);
   double _radiusMeters = 50.0;
 
@@ -29,9 +37,22 @@ class _AdminCreateSessionScreenState extends State<AdminCreateSessionScreen> {
   bool _isSubmitting = false;
   bool _isLocating = false;
 
+  late final AnimationController _compassController;
+  late final AnimationController _waveController;
+
   @override
   void initState() {
     super.initState();
+    _compassController = AnimationController(
+      vsync: this,
+      duration: const Duration(seconds: 16),
+    )..repeat();
+
+    _waveController = AnimationController(
+      vsync: this,
+      duration: const Duration(seconds: 6),
+    )..repeat();
+
     _moveToCurrentLocation();
   }
 
@@ -39,27 +60,18 @@ class _AdminCreateSessionScreenState extends State<AdminCreateSessionScreen> {
   void dispose() {
     _titleController.dispose();
     _mapController.dispose();
+    _compassController.dispose();
+    _waveController.dispose();
     super.dispose();
   }
 
-  /// Centers the map on the Admin's current GPS position
   Future<void> _moveToCurrentLocation() async {
     setState(() => _isLocating = true);
     try {
-      LocationPermission permission = await Geolocator.checkPermission();
-      if (permission == LocationPermission.denied) {
-        permission = await Geolocator.requestPermission();
-      }
-      if (permission == LocationPermission.whileInUse ||
-          permission == LocationPermission.always) {
-        final pos = await Geolocator.getCurrentPosition(
-          locationSettings: const LocationSettings(
-            accuracy: LocationAccuracy.high,
-          ),
-        );
-        final currentLatLng = LatLng(pos.latitude, pos.longitude);
-        setState(() => _selectedLocation = currentLatLng);
-        _mapController.move(currentLatLng, 17.0);
+      final current = await _sessionService.getCurrentPosition();
+      if (current != null && mounted) {
+        setState(() => _selectedLocation = current);
+        _mapController.move(current, 17.0);
       }
     } catch (e) {
       debugPrint('Location error: $e');
@@ -86,64 +98,91 @@ class _AdminCreateSessionScreenState extends State<AdminCreateSessionScreen> {
     if (picked != null) setState(() => _selectedTime = picked);
   }
 
-  /// Calls the Supabase PostGIS RPC to save the session
   Future<void> _createSession() async {
     if (!_formKey.currentState!.validate()) return;
 
     setState(() => _isSubmitting = true);
-
     try {
-      // Combine chosen date and start time in local timezone
-      final localStart = DateTime(
-        _selectedDate.year,
-        _selectedDate.month,
-        _selectedDate.day,
-        _selectedTime.hour,
-        _selectedTime.minute,
-      );
-      final localEnd = localStart.add(Duration(minutes: _durationMinutes));
-
-      // Call the SQL RPC created in Step 1
-      await Supabase.instance.client.rpc(
-        'create_attendance_session',
-        params: {
-          'p_title': _titleController.text.trim(),
-          // Always send ISO-8601 UTC strings to Postgres TIMESTAMPTZ
-          'p_start_time': localStart.toUtc().toIso8601String(),
-          'p_end_time': localEnd.toUtc().toIso8601String(),
-          'p_lat': _selectedLocation.latitude,
-          'p_lng': _selectedLocation.longitude,
-          'p_radius_meters': _radiusMeters.round(),
-        },
+      await _sessionService.publishSession(
+        title: _titleController.text,
+        date: _selectedDate,
+        time: _selectedTime,
+        durationMinutes: _durationMinutes,
+        center: _selectedLocation,
+        radiusMeters: _radiusMeters.round(),
       );
 
       if (!mounted) return;
-      ScaffoldMessenger.of(context).showSnackBar(
-        const SnackBar(
-          content: Text('Attendance session published!'),
-          backgroundColor: Colors.green,
-        ),
-      );
+      _showSnack('Attendance session published!', Colors.green.shade700);
       _titleController.clear();
     } on PostgrestException catch (e) {
       if (!mounted) return;
-      ScaffoldMessenger.of(context).showSnackBar(
-        SnackBar(
-          content: Text('Database error: ${e.message}'),
-          backgroundColor: Colors.red,
-        ),
-      );
+      _showSnack('Database error: ${e.message}', GrandLinePalette.strawHatRed);
     } catch (e) {
       if (!mounted) return;
-      ScaffoldMessenger.of(context).showSnackBar(
-        SnackBar(
-          content: Text('Unexpected error: $e'),
-          backgroundColor: Colors.red,
-        ),
-      );
+      _showSnack('Unexpected error: $e', GrandLinePalette.strawHatRed);
     } finally {
       if (mounted) setState(() => _isSubmitting = false);
     }
+  }
+
+  Future<void> _confirmAndLogout() async {
+    final shouldLogout = await showDialog<bool>(
+      context: context,
+      builder: (ctx) => AlertDialog(
+        backgroundColor: GrandLinePalette.oceanMid,
+        shape: RoundedRectangleBorder(
+          borderRadius: BorderRadius.circular(20),
+          side: BorderSide(
+            color: GrandLinePalette.treasureGold.withValues(alpha: 0.6),
+            width: 1.5,
+          ),
+        ),
+        title: const Row(
+          children: [
+            Icon(Icons.anchor_rounded, color: GrandLinePalette.treasureGold),
+            SizedBox(width: 10),
+            Text(
+              'Confirm Logout?',
+              style: TextStyle(
+                color: Colors.white,
+                fontWeight: FontWeight.bold,
+              ),
+            ),
+          ],
+        ),
+        content: Text(
+          'Are you sure you want to log out of Admin Page?',
+          style: TextStyle(
+            color: GrandLinePalette.parchmentCream.withValues(alpha: 0.9),
+          ),
+        ),
+        actions: [
+          TextButton(
+            onPressed: () => Navigator.of(ctx).pop(false),
+            child: const Text('Stay', style: TextStyle(color: Colors.white70)),
+          ),
+          FilledButton(
+            style: FilledButton.styleFrom(
+              backgroundColor: GrandLinePalette.strawHatRed,
+              foregroundColor: Colors.white,
+            ),
+            onPressed: () => Navigator.of(ctx).pop(true),
+            child: const Text('Log Out'),
+          ),
+        ],
+      ),
+    );
+
+    if (shouldLogout == true) {
+      await Supabase.instance.client.auth.signOut();
+    }
+  }
+
+  void _showSnack(String message, Color color) {
+    ScaffoldMessenger.of(
+      context,
+    ).showSnackBar(SnackBar(content: Text(message), backgroundColor: color));
   }
 
   @override
@@ -152,221 +191,467 @@ class _AdminCreateSessionScreenState extends State<AdminCreateSessionScreen> {
     final formattedTime = _selectedTime.format(context);
 
     return Scaffold(
-      appBar: AppBar(
-        title: const Text('Create Attendance Session'),
-        actions: [
-          IconButton(
-            icon: _isLocating
-                ? const SizedBox(
-                    width: 20,
-                    height: 20,
-                    child: CircularProgressIndicator(strokeWidth: 2),
-                  )
-                : const Icon(Icons.my_location),
-            tooltip: 'Use My Current Location',
-            onPressed: _isLocating ? null : _moveToCurrentLocation,
+      backgroundColor: GrandLinePalette.oceanDeep,
+      body: Stack(
+        children: [
+          Positioned.fill(
+            child: AnimatedBuilder(
+              animation: Listenable.merge([
+                _waveController,
+                _compassController,
+              ]),
+              builder: (context, _) => CustomPaint(
+                painter: GrandLineBackgroundPainter(
+                  waveProgress: _waveController.value,
+                  compassAngle: _compassController.value * 2 * math.pi,
+                ),
+              ),
+            ),
+          ),
+          SafeArea(
+            child: Column(
+              children: [
+                _buildTopBar(),
+                _buildTabSwitcher(),
+                const SizedBox(height: 8),
+                Expanded(
+                  child: _activeTabIndex == 0
+                      ? Form(
+                          key: _formKey,
+                          child: Column(
+                            children: [
+                              Expanded(
+                                flex: 5,
+                                child: AdminGeofenceMap(
+                                  mapController: _mapController,
+                                  selectedLocation: _selectedLocation,
+                                  radiusMeters: _radiusMeters,
+                                  isLocating: _isLocating,
+                                  onLocationSelected: (pt) =>
+                                      setState(() => _selectedLocation = pt),
+                                  onLocateMe: _moveToCurrentLocation,
+                                ),
+                              ),
+                              const SizedBox(height: 12),
+                              Expanded(
+                                flex: 6,
+                                child: _buildSessionFormCard(
+                                  formattedDate,
+                                  formattedTime,
+                                ),
+                              ),
+                            ],
+                          ),
+                        )
+                      : _activeTabIndex == 1
+                      ? AdminManageSessionsView(service: _sessionService)
+                      : AdminAnalyticsView(service: _sessionService),
+                ),
+              ],
+            ),
           ),
         ],
       ),
-      body: Form(
-        key: _formKey,
-        child: Column(
+    );
+  }
+
+  Widget _buildTabSwitcher() {
+    return Padding(
+      padding: const EdgeInsets.symmetric(horizontal: 16),
+      child: Container(
+        padding: const EdgeInsets.all(4),
+        decoration: BoxDecoration(
+          color: GrandLinePalette.oceanMid.withValues(alpha: 0.9),
+          borderRadius: BorderRadius.circular(14),
+          border: Border.all(
+            color: GrandLinePalette.treasureGold.withValues(alpha: 0.4),
+          ),
+        ),
+        child: Row(
           children: [
-            // 1. Interactive Geofence Map Picker
-            Expanded(
-              flex: 5,
-              child: Stack(
-                children: [
-                  FlutterMap(
-                    mapController: _mapController,
-                    options: MapOptions(
-                      initialCenter: _selectedLocation,
-                      initialZoom: 17.0,
-                      onTap: (tapPosition, point) {
-                        setState(() => _selectedLocation = point);
-                      },
-                    ),
-                    children: [
-                      TileLayer(
-                        urlTemplate:
-                            'https://tile.openstreetmap.org/{z}/{x}/{y}.png',
-                        userAgentPackageName: 'com.example.attendance_app',
-                      ),
-                      // Visual Geofence Circle (uses real meters!)
-                      CircleLayer(
-                        circles: [
-                          CircleMarker(
-                            point: _selectedLocation,
-                            radius: _radiusMeters,
-                            useRadiusInMeter: true,
-                            color: Colors.blue.withValues(alpha: 0.25),
-                            borderColor: Colors.blue,
-                            borderStrokeWidth: 2,
-                          ),
-                        ],
-                      ),
-                      // Center Pin Marker
-                      MarkerLayer(
-                        markers: [
-                          Marker(
-                            point: _selectedLocation,
-                            width: 40,
-                            height: 40,
-                            child: const Icon(
-                              Icons.location_on,
-                              color: Colors.red,
-                              size: 40,
-                            ),
-                          ),
-                        ],
-                      ),
-                    ],
+            _tabButton(
+              index: 0,
+              icon: Icons.add_location_alt_rounded,
+              label: 'Create',
+            ),
+            _tabButton(
+              index: 1,
+              icon: Icons.edit_calendar_rounded,
+              label: 'Manage',
+            ),
+            _tabButton(
+              index: 2,
+              icon: Icons.bar_chart_rounded,
+              label: 'Analytics',
+            ),
+          ],
+        ),
+      ),
+    );
+  }
+
+  Widget _tabButton({
+    required int index,
+    required IconData icon,
+    required String label,
+  }) {
+    final isActive = _activeTabIndex == index;
+    return Expanded(
+      child: GestureDetector(
+        onTap: () => setState(() => _activeTabIndex = index),
+        child: AnimatedContainer(
+          duration: const Duration(milliseconds: 200),
+          padding: const EdgeInsets.symmetric(vertical: 9),
+          decoration: BoxDecoration(
+            color: isActive ? GrandLinePalette.strawHatRed : Colors.transparent,
+            borderRadius: BorderRadius.circular(10),
+            border: isActive
+                ? Border.all(
+                    color: GrandLinePalette.treasureGold.withValues(alpha: 0.7),
+                  )
+                : null,
+          ),
+          child: Row(
+            mainAxisAlignment: MainAxisAlignment.center,
+            children: [
+              Icon(
+                icon,
+                size: 15,
+                color: isActive
+                    ? GrandLinePalette.treasureGold
+                    : Colors.white60,
+              ),
+              const SizedBox(width: 5),
+              Flexible(
+                child: Text(
+                  label,
+                  overflow: TextOverflow.ellipsis,
+                  style: TextStyle(
+                    color: isActive ? Colors.white : Colors.white70,
+                    fontWeight: FontWeight.bold,
+                    fontSize: 12,
                   ),
-                  Positioned(
-                    top: 10,
-                    left: 10,
-                    right: 10,
-                    child: Card(
-                      color: Colors.black.withValues(alpha: 0.75),
-                      child: const Padding(
-                        padding: EdgeInsets.symmetric(
-                          vertical: 6,
-                          horizontal: 12,
-                        ),
-                        child: Text(
-                          'Tap anywhere on the map to set the geofence center',
-                          style: TextStyle(color: Colors.white, fontSize: 12),
-                          textAlign: TextAlign.center,
-                        ),
-                      ),
-                    ),
-                  ),
-                ],
+                ),
+              ),
+            ],
+          ),
+        ),
+      ),
+    );
+  }
+
+  Widget _buildTopBar() {
+    final subtitle = _activeTabIndex == 0
+        ? 'CREATE SESSION'
+        : _activeTabIndex == 1
+        ? 'MANAGE SESSIONS'
+        : 'ATTENDANCE ANALYTICS';
+
+    return Padding(
+      padding: const EdgeInsets.symmetric(horizontal: 16, vertical: 8),
+      child: Row(
+        children: [
+          Container(
+            width: 40,
+            height: 40,
+            decoration: BoxDecoration(
+              shape: BoxShape.circle,
+              color: GrandLinePalette.oceanMid,
+              border: Border.all(
+                color: GrandLinePalette.treasureGold,
+                width: 1.8,
               ),
             ),
-
-            // 2. Session Details & Controls Form
-            Expanded(
-              flex: 6,
-              child: SingleChildScrollView(
-                padding: const EdgeInsets.all(16.0),
-                child: Column(
-                  crossAxisAlignment: CrossAxisAlignment.stretch,
-                  children: [
-                    // Session Title
-                    TextFormField(
-                      controller: _titleController,
-                      decoration: const InputDecoration(
-                        labelText: 'Session / Class Name',
-                        hintText: 'e.g., CS101 - Morning Lecture',
-                        border: OutlineInputBorder(),
-                        prefixIcon: Icon(Icons.class_),
-                      ),
-                      validator: (val) => (val == null || val.trim().isEmpty)
-                          ? 'Please enter a session name'
-                          : null,
-                    ),
-                    const SizedBox(height: 16),
-
-                    // Geofence Radius Slider
-                    Row(
-                      mainAxisAlignment: MainAxisAlignment.spaceBetween,
-                      children: [
-                        const Text(
-                          'Geofence Radius',
-                          style: TextStyle(fontWeight: FontWeight.bold),
-                        ),
-                        Text(
-                          '${_radiusMeters.round()} meters',
-                          style: const TextStyle(
-                            color: Colors.blue,
-                            fontWeight: FontWeight.bold,
-                          ),
-                        ),
-                      ],
-                    ),
-                    Slider(
-                      value: _radiusMeters,
-                      min: 15,
-                      max: 300,
-                      divisions: 57,
-                      label: '${_radiusMeters.round()}m',
-                      onChanged: (val) => setState(() => _radiusMeters = val),
-                    ),
-                    const SizedBox(height: 8),
-
-                    // Date & Start Time Pickers
-                    Row(
-                      children: [
-                        Expanded(
-                          child: OutlinedButton.icon(
-                            onPressed: _pickDate,
-                            icon: const Icon(Icons.calendar_today, size: 18),
-                            label: Text(formattedDate),
-                          ),
-                        ),
-                        const SizedBox(width: 12),
-                        Expanded(
-                          child: OutlinedButton.icon(
-                            onPressed: _pickTime,
-                            icon: const Icon(Icons.access_time, size: 18),
-                            label: Text(formattedTime),
-                          ),
-                        ),
-                      ],
-                    ),
-                    const SizedBox(height: 16),
-
-                    // Duration Selector
-                    DropdownButtonFormField<int>(
-                      initialValue: _durationMinutes,
-                      decoration: const InputDecoration(
-                        labelText: 'Attendance Window Duration',
-                        border: OutlineInputBorder(),
-                        prefixIcon: Icon(Icons.timer),
-                      ),
-                      items: const [
-                        DropdownMenuItem(value: 10, child: Text('10 Minutes')),
-                        DropdownMenuItem(value: 15, child: Text('15 Minutes')),
-                        DropdownMenuItem(value: 30, child: Text('30 Minutes')),
-                        DropdownMenuItem(value: 45, child: Text('45 Minutes')),
-                        DropdownMenuItem(value: 60, child: Text('1 Hour')),
-                        DropdownMenuItem(value: 120, child: Text('2 Hours')),
-                      ],
-                      onChanged: (val) {
-                        if (val != null) setState(() => _durationMinutes = val);
-                      },
-                    ),
-                    const SizedBox(height: 20),
-
-                    // Publish Button
-                    FilledButton.icon(
-                      onPressed: _isSubmitting ? null : _createSession,
-                      style: FilledButton.styleFrom(
-                        padding: const EdgeInsets.symmetric(vertical: 16),
-                      ),
-                      icon: _isSubmitting
-                          ? const SizedBox(
-                              width: 20,
-                              height: 20,
-                              child: CircularProgressIndicator(
-                                strokeWidth: 2,
-                                color: Colors.white,
-                              ),
-                            )
-                          : const Icon(Icons.publish),
-                      label: Text(
-                        _isSubmitting
-                            ? 'Publishing...'
-                            : 'Publish Attendance Session',
-                        style: const TextStyle(fontSize: 16),
-                      ),
-                    ),
+            child: CustomPaint(painter: MiniStrawHatPainter()),
+          ),
+          const SizedBox(width: 10),
+          Column(
+            crossAxisAlignment: CrossAxisAlignment.start,
+            children: [
+              ShaderMask(
+                shaderCallback: (bounds) => const LinearGradient(
+                  colors: [
+                    Color(0xFFFFE082),
+                    GrandLinePalette.treasureGold,
+                    Color(0xFFFF8F00),
                   ],
+                ).createShader(bounds),
+                child: const Text(
+                  'CiteInTime',
+                  style: TextStyle(
+                    fontSize: 20,
+                    fontWeight: FontWeight.w900,
+                    letterSpacing: 1.0,
+                    color: Colors.white,
+                  ),
+                ),
+              ),
+              Text(
+                subtitle,
+                style: TextStyle(
+                  fontSize: 9.5,
+                  fontWeight: FontWeight.w700,
+                  letterSpacing: 1.3,
+                  color: GrandLinePalette.treasureGold.withValues(alpha: 0.85),
+                ),
+              ),
+            ],
+          ),
+          const Spacer(),
+          IconButton(
+            tooltip: 'Log Out',
+            icon: const Icon(Icons.logout_rounded, color: Colors.white70),
+            onPressed: _confirmAndLogout,
+          ),
+        ],
+      ),
+    );
+  }
+
+  Widget _buildSessionFormCard(String formattedDate, String formattedTime) {
+    return Container(
+      margin: const EdgeInsets.fromLTRB(16, 0, 16, 16),
+      padding: const EdgeInsets.all(18),
+      decoration: BoxDecoration(
+        color: GrandLinePalette.oceanMid.withValues(alpha: 0.92),
+        borderRadius: BorderRadius.circular(22),
+        border: Border.all(
+          color: GrandLinePalette.treasureGold.withValues(alpha: 0.45),
+          width: 1.4,
+        ),
+        boxShadow: [
+          BoxShadow(
+            color: Colors.black.withValues(alpha: 0.4),
+            blurRadius: 18,
+            offset: const Offset(0, 8),
+          ),
+        ],
+      ),
+      child: SingleChildScrollView(
+        child: Column(
+          crossAxisAlignment: CrossAxisAlignment.stretch,
+          children: [
+            TextFormField(
+              controller: _titleController,
+              style: const TextStyle(
+                color: Colors.white,
+                fontWeight: FontWeight.w600,
+              ),
+              decoration: _inputDecoration(
+                label: 'Session / Class Name',
+                hint: 'e.g., Cite Day 2026 Day 1',
+                icon: Icons.class_rounded,
+              ),
+              validator: (val) => (val == null || val.trim().isEmpty)
+                  ? 'Please enter a session name'
+                  : null,
+            ),
+            const SizedBox(height: 14),
+            Row(
+              mainAxisAlignment: MainAxisAlignment.spaceBetween,
+              children: [
+                const Text(
+                  'Log Pose Geofence Radius',
+                  style: TextStyle(
+                    color: Colors.white,
+                    fontWeight: FontWeight.bold,
+                    fontSize: 13,
+                  ),
+                ),
+                Container(
+                  padding: const EdgeInsets.symmetric(
+                    horizontal: 10,
+                    vertical: 3,
+                  ),
+                  decoration: BoxDecoration(
+                    color: GrandLinePalette.treasureGold.withValues(
+                      alpha: 0.16,
+                    ),
+                    borderRadius: BorderRadius.circular(12),
+                    border: Border.all(
+                      color: GrandLinePalette.treasureGold.withValues(
+                        alpha: 0.5,
+                      ),
+                    ),
+                  ),
+                  child: Text(
+                    '${_radiusMeters.round()} meters',
+                    style: const TextStyle(
+                      color: GrandLinePalette.treasureGold,
+                      fontWeight: FontWeight.bold,
+                      fontSize: 12,
+                    ),
+                  ),
+                ),
+              ],
+            ),
+            SliderTheme(
+              data: SliderTheme.of(context).copyWith(
+                activeTrackColor: GrandLinePalette.treasureGold,
+                inactiveTrackColor: GrandLinePalette.oceanDeep,
+                thumbColor: GrandLinePalette.strawHatRed,
+                overlayColor: GrandLinePalette.treasureGold.withValues(
+                  alpha: 0.2,
+                ),
+                valueIndicatorColor: GrandLinePalette.strawHatRed,
+              ),
+              child: Slider(
+                value: _radiusMeters,
+                min: 15,
+                max: 300,
+                divisions: 57,
+                label: '${_radiusMeters.round()}m',
+                onChanged: (val) => setState(() => _radiusMeters = val),
+              ),
+            ),
+            Row(
+              children: [
+                Expanded(
+                  child: _buildPickerButton(
+                    icon: Icons.calendar_today_rounded,
+                    label: formattedDate,
+                    onPressed: _pickDate,
+                  ),
+                ),
+                const SizedBox(width: 10),
+                Expanded(
+                  child: _buildPickerButton(
+                    icon: Icons.access_time_rounded,
+                    label: formattedTime,
+                    onPressed: _pickTime,
+                  ),
+                ),
+              ],
+            ),
+            const SizedBox(height: 14),
+            DropdownButtonFormField<int>(
+              initialValue: _durationMinutes,
+              dropdownColor: GrandLinePalette.oceanDeep,
+              style: const TextStyle(
+                color: Colors.white,
+                fontWeight: FontWeight.w600,
+              ),
+              decoration: _inputDecoration(
+                label: 'Attendance Window Duration',
+                icon: Icons.timer_rounded,
+              ),
+              items: const [
+                DropdownMenuItem(value: 10, child: Text('10 Minutes')),
+                DropdownMenuItem(value: 15, child: Text('15 Minutes')),
+                DropdownMenuItem(value: 30, child: Text('30 Minutes')),
+                DropdownMenuItem(value: 45, child: Text('45 Minutes')),
+                DropdownMenuItem(value: 60, child: Text('1 Hour')),
+                DropdownMenuItem(value: 120, child: Text('2 Hours')),
+              ],
+              onChanged: (val) {
+                if (val != null) setState(() => _durationMinutes = val);
+              },
+            ),
+            const SizedBox(height: 18),
+            FilledButton.icon(
+              onPressed: _isSubmitting ? null : _createSession,
+              style: FilledButton.styleFrom(
+                backgroundColor: GrandLinePalette.strawHatRed,
+                foregroundColor: Colors.white,
+                padding: const EdgeInsets.symmetric(vertical: 15),
+                shape: RoundedRectangleBorder(
+                  borderRadius: BorderRadius.circular(14),
+                  side: BorderSide(
+                    color: GrandLinePalette.treasureGold.withValues(alpha: 0.7),
+                  ),
+                ),
+                elevation: 6,
+              ),
+              icon: _isSubmitting
+                  ? const SizedBox(
+                      width: 20,
+                      height: 20,
+                      child: CircularProgressIndicator(
+                        strokeWidth: 2.5,
+                        color: GrandLinePalette.treasureGold,
+                      ),
+                    )
+                  : const Icon(
+                      Icons.explore_rounded,
+                      color: GrandLinePalette.treasureGold,
+                    ),
+              label: Text(
+                _isSubmitting
+                    ? 'Setting Log Pose...'
+                    : 'Publish Attendance Session',
+                style: const TextStyle(
+                  fontSize: 15.5,
+                  fontWeight: FontWeight.bold,
+                  letterSpacing: 0.4,
                 ),
               ),
             ),
           ],
+        ),
+      ),
+    );
+  }
+
+  Widget _buildPickerButton({
+    required IconData icon,
+    required String label,
+    required VoidCallback onPressed,
+  }) {
+    return OutlinedButton.icon(
+      onPressed: onPressed,
+      style: OutlinedButton.styleFrom(
+        foregroundColor: GrandLinePalette.parchmentCream,
+        backgroundColor: GrandLinePalette.oceanDeep.withValues(alpha: 0.65),
+        padding: const EdgeInsets.symmetric(vertical: 13, horizontal: 10),
+        side: BorderSide(
+          color: GrandLinePalette.treasureGold.withValues(alpha: 0.4),
+        ),
+        shape: RoundedRectangleBorder(borderRadius: BorderRadius.circular(14)),
+      ),
+      icon: Icon(icon, size: 17, color: GrandLinePalette.treasureGold),
+      label: Text(
+        label,
+        style: const TextStyle(fontSize: 12.5, fontWeight: FontWeight.w600),
+        overflow: TextOverflow.ellipsis,
+      ),
+    );
+  }
+
+  InputDecoration _inputDecoration({
+    required String label,
+    required IconData icon,
+    String? hint,
+  }) {
+    return InputDecoration(
+      labelText: label,
+      hintText: hint,
+      labelStyle: const TextStyle(color: Colors.white70),
+      hintStyle: TextStyle(color: Colors.white.withValues(alpha: 0.3)),
+      prefixIcon: Icon(icon, color: GrandLinePalette.treasureGold),
+      filled: true,
+      fillColor: GrandLinePalette.oceanDeep.withValues(alpha: 0.7),
+      enabledBorder: OutlineInputBorder(
+        borderRadius: BorderRadius.circular(14),
+        borderSide: BorderSide(
+          color: GrandLinePalette.treasureGold.withValues(alpha: 0.3),
+        ),
+      ),
+      focusedBorder: OutlineInputBorder(
+        borderRadius: BorderRadius.circular(14),
+        borderSide: const BorderSide(
+          color: GrandLinePalette.treasureGold,
+          width: 2,
+        ),
+      ),
+      errorBorder: OutlineInputBorder(
+        borderRadius: BorderRadius.circular(14),
+        borderSide: const BorderSide(color: GrandLinePalette.strawHatRed),
+      ),
+      focusedErrorBorder: OutlineInputBorder(
+        borderRadius: BorderRadius.circular(14),
+        borderSide: const BorderSide(
+          color: GrandLinePalette.strawHatRed,
+          width: 2,
         ),
       ),
     );
