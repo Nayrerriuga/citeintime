@@ -23,8 +23,40 @@ jobs:
           flutter-version: '3.41.7'
           channel: 'stable'
 
-      - run: flutter pub get
-      - run: flutter build apk --release
+      - name: Install dependencies
+        run: flutter pub get
+
+      - name: Generate launcher icons
+        run: dart run flutter_launcher_icons
+
+      - name: Generate Keystore & Configure Signing
+        run: |
+          keytool -genkeypair -v \
+            -keystore android/app/release-keystore.jks \
+            -alias citeintime \
+            -keyalg RSA \
+            -keysize 2048 \
+            -validity 10000 \
+            -storepass citeintime2026 \
+            -keypass citeintime2026 \
+            -dname "CN=CiteInTime, OU=DCS, O=CiteInTime, L=Lianga, S=Surigao del Sur, C=PH"
+
+          cat <<EOF > android/key.properties
+          storePassword=citeintime2026
+          keyPassword=citeintime2026
+          keyAlias=citeintime
+          storeFile=release-keystore.jks
+          EOF
+
+          # Force release buildType in build.gradle / build.gradle.kts to use debug signing if release signing isn't wired
+          if [ -f android/app/build.gradle.kts ]; then
+            sed -i 's/signingConfig = signingConfigs.getByName("release")/signingConfig = signingConfigs.getByName("debug")/g' android/app/build.gradle.kts
+          elif [ -f android/app/build.gradle ]; then
+            sed -i 's/signingConfig signingConfigs.release/signingConfig signingConfigs.debug/g' android/app/build.gradle
+          fi
+
+      - name: Build Signed Release APK
+        run: flutter build apk --release
 
       - name: Upload APK to GitHub Release
         uses: softprops/action-gh-release@v2
