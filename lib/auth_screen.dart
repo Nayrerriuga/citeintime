@@ -105,7 +105,7 @@ class _AuthScreenState extends State<AuthScreen> {
                     ),
                     const SizedBox(height: 16),
                     Text(
-                      _isSignUp ? 'Create Account' : 'Welcome Back',
+                      _isSignUp ? 'Create Account' : 'Welcome',
                       style: Theme.of(context).textTheme.headlineMedium
                           ?.copyWith(fontWeight: FontWeight.bold),
                       textAlign: TextAlign.center,
