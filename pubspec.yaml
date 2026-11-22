@@ -25,6 +25,9 @@ dependencies:
 
   # Icons
   cupertino_icons: ^1.0.8
+  ota_update: ^7.1.0
+  http: ^1.6.0
+  package_info_plus: ^10.2.2
 
 dev_dependencies:
   flutter_test:
@@ -34,6 +37,3 @@ dev_dependencies:
 flutter:
   uses-material-design: true
 
-  # Required for Shorebird automatic OTA updates
- # assets:
-  #  - shorebird.yaml
