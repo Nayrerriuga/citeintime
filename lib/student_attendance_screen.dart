@@ -66,30 +66,77 @@ class _StudentAttendanceScreenState extends State<StudentAttendanceScreen>
   }
 
   Future<void> _initializeScreen() async {
-    await _attendanceService.initNotifications();
+    // Run notification setup asynchronously so permission prompts never block UI loading
+    _attendanceService.initNotifications().catchError((_) {});
     await _refreshAllData();
   }
 
   Future<void> _refreshAllData() async {
-    final profile = await _attendanceService.fetchStudentProfile();
-    Set<String> checkedIn = _checkedInSessionIds;
     try {
-      checkedIn = await _attendanceService.fetchCheckedInSessionIds();
-    } catch (e) {
-      _showSnack('Could not refresh logs: $e', GrandLinePalette.strawHatRed);
-    }
+      final results = await Future.wait([
+        _attendanceService.fetchStudentProfile().timeout(
+          const Duration(seconds: 8),
+          onTimeout: () => {'name': 'Crew Member', 'id': '', 'yearLevel': ''},
+        ),
+        _attendanceService.fetchCheckedInSessionIds().timeout(
+          const Duration(seconds: 8),
+          onTimeout: () => _checkedInSessionIds,
+        ),
+      ]);
 
-    if (mounted) {
-      setState(() {
-        _studentName = profile['name'] ?? 'Crew Member';
-        _studentId = profile['id'] ?? '';
-        _yearLevel = profile['yearLevel'] ?? '';
-        _checkedInSessionIds = checkedIn;
-      });
+      final profile = results[0] as Map<String, String>;
+      final checkedIn = results[1] as Set<String>;
+
+      if (mounted) {
+        setState(() {
+          _studentName = profile['name'] ?? 'Crew Member';
+          _studentId = profile['id'] ?? '';
+          _yearLevel = profile['yearLevel'] ?? '';
+          _checkedInSessionIds = checkedIn;
+        });
+      }
+    } catch (e) {
+      if (mounted) {
+        _showSnack(
+          'Could not refresh profile: $e',
+          GrandLinePalette.strawHatRed,
+        );
+      }
     }
 
     _updateStudentLocation();
+    await _fetchSessionsOnce();
     _listenToSessions();
+  }
+
+  /// Immediate one-shot query so the loading spinner always resolves even if Realtime stalls
+  Future<void> _fetchSessionsOnce() async {
+    try {
+      final cutoff = DateTime.now().toUtc().subtract(const Duration(hours: 2));
+      final data = await _supabase
+          .from('attendance_sessions')
+          .select('id, title, start_time, end_time, radius_meters, lat, lng')
+          .gte('end_time', cutoff.toIso8601String())
+          .order('start_time', ascending: true)
+          .timeout(const Duration(seconds: 8));
+
+      final list = List<Map<String, dynamic>>.from(data);
+      if (mounted) {
+        setState(() {
+          _sessions = list;
+          _isLoading = false;
+        });
+        _checkUpcomingAlerts(list);
+      }
+    } catch (e) {
+      if (mounted) {
+        setState(() => _isLoading = false);
+        _showSnack(
+          'Could not load attendance sessions: $e',
+          GrandLinePalette.strawHatRed,
+        );
+      }
+    }
   }
 
   Future<void> _updateStudentLocation() async {
@@ -140,13 +187,10 @@ class _StudentAttendanceScreenState extends State<StudentAttendanceScreen>
               _checkUpcomingAlerts(activeOrUpcoming);
             }
           },
-          onError: (Object error) {
-            if (!mounted) return;
-            setState(() => _isLoading = false);
-            _showSnack(
-              'Could not load attendance sessions: $error',
-              GrandLinePalette.strawHatRed,
-            );
+          onError: (_) {
+            if (mounted && _isLoading) {
+              setState(() => _isLoading = false);
+            }
           },
         );
   }
